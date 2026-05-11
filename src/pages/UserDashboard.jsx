@@ -12,15 +12,20 @@ import {
   LogOut,
   Inbox,
   Clock,
-  CheckCheck
+  CheckCheck,
+  CreditCard,
+  Share2
 } from 'lucide-react';
 import { useAuth } from '../lib/AuthContext.jsx';
 import * as db from '../lib/db.js';
 import { supabase } from '../lib/supabaseClient.js';
 import ThemeToggle from '../components/ThemeToggle.jsx';
 import ConfirmDialog from '../components/ConfirmDialog.jsx';
+import TokenPurchaseModal from '../components/TokenPurchaseModal.jsx';
+import ShareModal from '../components/ShareModal.jsx';
 import { useToast } from '../components/Toast.jsx';
 import { TodoSkeletonList, SkeletonLine } from '../components/Skeleton.jsx';
+import { Coins } from 'lucide-react';
 
 const FILTERS = [
   { id: 'all', label: 'All' },
@@ -33,10 +38,15 @@ export default function UserDashboard() {
   const navigate = useNavigate();
   const toast = useToast();
 
-  const [todos, setTodos] = useState([]);
-  const [word, setWord] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [wordLoading, setWordLoading] = useState(true);
+  // Stale-while-revalidate: hydrate from localStorage cache so the dashboard
+  // shows real data on the very first render. Network fetch then refreshes
+  // it in the background. `loading` is only true when we have nothing to show.
+  const cachedTodos = db.getCachedTodos(user.id);
+  const cachedWord = db.getCachedWordOfDay();
+  const [todos, setTodos] = useState(() => cachedTodos || []);
+  const [word, setWord] = useState(() => cachedWord);
+  const [loading, setLoading] = useState(() => cachedTodos === null);
+  const [wordLoading, setWordLoading] = useState(() => cachedWord === null);
 
   const [title, setTitle] = useState('');
   const [note, setNote] = useState('');
@@ -61,11 +71,24 @@ export default function UserDashboard() {
   const [confirmDeleteTarget, setConfirmDeleteTarget] = useState(null);
   const [confirmDeleteBusy, setConfirmDeleteBusy] = useState(false);
 
+  // Token balance + purchase flow
+  const [tokens, setTokens] = useState(user.tokens ?? 0);
+  const [purchaseOpen, setPurchaseOpen] = useState(false);
+  const [shareOpen, setShareOpen] = useState(false);
+
+  // Keep local tokens in sync when AuthContext re-fetches the profile.
+  useEffect(() => {
+    setTokens(user.tokens ?? 0);
+  }, [user.tokens]);
+
   const [filter, setFilter] = useState('all');
   const [query, setQuery] = useState('');
   const searchRef = useRef(null);
 
-  // ------- initial load -------
+  // ------- background refresh -------
+  // Always refetch on mount to catch changes made elsewhere (other device,
+  // admin edits, etc.). If we had cached data, the UI is already showing it
+  // — these updates will just replace state when they land.
   useEffect(() => {
     let mounted = true;
     db.getTodos(user.id)
@@ -81,6 +104,34 @@ export default function UserDashboard() {
 
     return () => { mounted = false; };
   }, [user.id]);
+
+  // ------- 3DS return handler -------
+  // After a 3DS challenge, Tap redirects the user back to /user?tap_id=ch_xxx.
+  // Detect that here, verify the charge with our backend, and credit tokens.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const tapId = params.get('tap_id');
+    const hasPending = localStorage.getItem('todoapp.pending_purchase');
+    if (!tapId && !hasPending) return;
+
+    // Strip query params from the URL so refreshing doesn't re-trigger.
+    const cleanUrl = window.location.pathname + window.location.hash;
+    window.history.replaceState({}, '', cleanUrl);
+
+    const toastId = toast.info('Completing your purchase…', { durationMs: 8000 });
+    db.completePendingPurchase(tapId)
+      .then((res) => {
+        if (!res) return;
+        setTokens(res.newBalance);
+        toast.success(
+          `Purchased ${res.tokens} tokens · new balance ${res.newBalance}.`
+        );
+      })
+      .catch((err) => {
+        toast.error(err.message, { durationMs: 6000 });
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // ------- realtime word-of-day -------
   useEffect(() => {
@@ -169,23 +220,72 @@ export default function UserDashboard() {
     if (fileInputRef.current) fileInputRef.current.value = '';
   }
 
-  // ------- add -------
+  // ------- add (gated by token balance) -------
   async function handleAdd(e) {
     e.preventDefault();
     if (!title.trim()) return;
-    setAdding(true);
     setAddError('');
+
+    if (tokens <= 0) {
+      setPurchaseOpen(true);
+      return;
+    }
+
+    setAdding(true);
     try {
+      // Consume the token first so we never end up with a free todo if
+      // the network fails between the two calls.
+      const remaining = await db.consumeToken();
+      setTokens(remaining);
+
       const created = await db.addTodo(user.id, { title, note, imageFile });
       setTodos((prev) => [created, ...prev]);
       setTitle('');
       setNote('');
       clearImage();
-      toast.success('To-do added.');
+      toast.success(`To-do added · ${remaining} token${remaining === 1 ? '' : 's'} left.`);
     } catch (err) {
       setAddError(err.message);
+      // If the consume succeeded but the insert failed, the user has lost
+      // a token. Refresh balance from server so display matches reality.
+      try {
+        const fresh = await db.getMyTokens();
+        setTokens(fresh);
+      } catch {}
     } finally {
       setAdding(false);
+    }
+  }
+
+  async function handlePurchased({ tokens: bought, amount, currency, referenceId }) {
+    try {
+      const result = await db.purchaseTokens({
+        tokens: bought,
+        amount,
+        currency,
+        referenceId
+      });
+
+      // 3DS path — purchaseTokens triggered a redirect to Tap's challenge
+      // page. The browser is navigating away; let the modal show a quick
+      // notice but don't touch local balance state.
+      if (result && result.redirecting) {
+        toast.info('Redirecting you to your bank for 3D Secure…');
+        return;
+      }
+
+      // Immediate-capture path (no 3DS, or frictionless 3DS).
+      setTokens(result);
+      setPurchaseOpen(false);
+      toast.success(
+        `Purchased ${bought} tokens · new balance ${result}.`
+      );
+    } catch (err) {
+      // Close the modal so the user sees the friendly reason and can retry.
+      // (Failed attempts are already logged in the transactions table for
+      // admin audit, with the underlying Tap status as the reference id.)
+      setPurchaseOpen(false);
+      toast.error(err.message, { durationMs: 6000 });
     }
   }
 
@@ -336,6 +436,26 @@ export default function UserDashboard() {
       <header className="topbar glass">
         <h1 className="brand">Todo<span>App</span></h1>
         <div className="user-pill">
+          <button
+            type="button"
+            className="balance-chip"
+            onClick={() => setPurchaseOpen(true)}
+            title="Tap to buy more tokens"
+          >
+            <Coins size={14} />
+            <span>{tokens}</span>
+            <span className="balance-chip-label">tokens</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setShareOpen(true)}
+            className="btn ghost icon-btn"
+            aria-label="Share app"
+            title="Share app"
+          >
+            <Share2 size={16} />
+            <span className="btn-label">Share</span>
+          </button>
           <ThemeToggle />
           <span className="user-name">{user.name || user.email}</span>
           <button onClick={handleLogout} className="btn ghost icon-btn" aria-label="Log out">
@@ -351,10 +471,11 @@ export default function UserDashboard() {
         <section className="card">
           <div className="card-header">
             <h2>My to-dos</h2>
-            <div className="search-wrap">
+            <div className="search-wrap" >
               <Search size={16} className="search-icon" aria-hidden="true" />
               <input
                 ref={searchRef}
+                style={{borderRadius:"10px"}}
                 type="search"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
@@ -405,11 +526,27 @@ export default function UserDashboard() {
               <ImageIcon size={16} />
               {imageFile ? 'Image ready' : 'Image'}
             </label>
-            <button type="submit" className="btn primary icon-btn" disabled={adding}>
-              <Plus size={16} />
-              {adding ? 'Adding…' : 'Add'}
+            <button
+              type="submit"
+              className="btn primary icon-btn"
+              disabled={adding}
+            >
+              {tokens > 0 ? <Plus size={16} /> : <Coins size={16} />}
+              {adding ? 'Adding…' : tokens > 0 ? 'Add' : 'Buy tokens'}
             </button>
           </form>
+
+          <div className="cost-hint">
+            <Coins size={12} aria-hidden="true" />
+            {tokens > 0 ? (
+              <span>
+                Costs <strong>1 token</strong> · <strong>{tokens}</strong>{' '}
+                left
+              </span>
+            ) : (
+              <span>You're out of tokens — buy more to keep adding.</span>
+            )}
+          </div>
 
           {imagePreview && (
             <div className="preview-row">
@@ -644,6 +781,18 @@ export default function UserDashboard() {
         onCancel={() => setConfirmTarget(null)}
       />
 
+      <TokenPurchaseModal
+        open={purchaseOpen}
+        customer={buildCustomerFromUser(user)}
+        onPurchased={handlePurchased}
+        onCancel={() => setPurchaseOpen(false)}
+      />
+
+      <ShareModal
+        open={shareOpen}
+        onClose={() => setShareOpen(false)}
+      />
+
       <ConfirmDialog
         open={!!confirmDeleteTarget}
         title="Delete this to-do?"
@@ -663,6 +812,21 @@ export default function UserDashboard() {
       />
     </>
   );
+}
+
+// Tap requires non-empty first AND last name for tokenization. Fall back to
+// reasonable defaults so users with just an email or a single-word display
+// name don't fail card validation silently.
+function buildCustomerFromUser(user) {
+  const raw = (user.name || '').trim();
+  const parts = raw ? raw.split(/\s+/) : [];
+  const first = parts[0] || 'Test';
+  const last = parts.slice(1).join(' ') || (parts[0] ? '·' : 'User');
+  return {
+    firstName: first.length >= 2 ? first : first + 'X',
+    lastName: last.length >= 2 ? last : 'User',
+    email: user.email || ''
+  };
 }
 
 function PinnedWord({ word, loading }) {

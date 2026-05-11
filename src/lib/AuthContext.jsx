@@ -85,7 +85,14 @@ export function AuthProvider({ children }) {
         return;
       }
 
-      // For SIGNED_IN, INITIAL_SESSION, TOKEN_REFRESHED, USER_UPDATED — refetch profile.
+      // The bootstrap useEffect already fetches the profile on mount, and
+      // login()/signUp() set the user directly. INITIAL_SESSION and SIGNED_IN
+      // would otherwise trigger a duplicate /profiles round-trip in the same
+      // tick. db.getCurrentUser() dedupes concurrent calls internally, but we
+      // skip here entirely to avoid even the extra await.
+      if (event === 'INITIAL_SESSION' || event === 'SIGNED_IN') return;
+
+      // For TOKEN_REFRESHED / USER_UPDATED, refresh the profile.
       try {
         const u = await withTimeout(db.getCurrentUser(), VERIFY_TIMEOUT_MS, 'getCurrentUser (event)');
         if (!mounted) return;

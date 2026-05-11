@@ -1,0 +1,11 @@
+# Supabase CLI project config.
+# Edge Function settings live here so re-deploys keep the right options
+# without having to remember CLI flags every time.
+
+project_id = "dqzuuqltbalqvqzrrzcu"
+
+[functions.create-charge]
+# Browser CORS preflight has no Authorization header. Disable platform-level
+# JWT verification so OPTIONS reaches our function; the function code still
+# verifies the user via supabase.auth.getUser().
+verify_jwt = false

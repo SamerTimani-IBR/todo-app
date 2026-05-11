@@ -1,26 +1,29 @@
 import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { LogIn } from 'lucide-react';
+import { LogIn, Share2 } from 'lucide-react';
 import { useAuth } from '../lib/AuthContext.jsx';
 import ThemeToggle from '../components/ThemeToggle.jsx';
 import PasswordInput from '../components/PasswordInput.jsx';
+import ShareModal from '../components/ShareModal.jsx';
 
 export default function Login() {
   const { login } = useAuth();
   const navigate = useNavigate();
 
-  const [role, setRole] = useState('user');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [shareOpen, setShareOpen] = useState(false);
 
   async function handleSubmit(e) {
     e.preventDefault();
     setError('');
     setSubmitting(true);
     try {
-      const session = await login({ email, password, role });
+      // No role pre-selection — Supabase returns the user's actual role on
+      // the profile, and we route based on that. One login form for everyone.
+      const session = await login({ email, password });
       navigate(session.role === 'admin' ? '/admin' : '/user', { replace: true });
     } catch (err) {
       setError(err.message);
@@ -31,27 +34,22 @@ export default function Login() {
 
   return (
     <div className="auth-shell">
-      <div className="auth-corner"><ThemeToggle /></div>
+      <div className="auth-corner">
+        <button
+          type="button"
+          onClick={() => setShareOpen(true)}
+          className="btn ghost icon-btn share-btn"
+          aria-label="Share app"
+          title="Share app"
+        >
+          <Share2 size={16} />
+          <span className="btn-label">Share</span>
+        </button>
+        <ThemeToggle />
+      </div>
       <div className="auth-card">
         <h1 className="brand">Todo<span>App</span></h1>
         <p className="muted">Sign in to continue</p>
-
-        <div className="role-switch" role="tablist">
-          <button
-            type="button"
-            className={`role-tab ${role === 'user' ? 'active' : ''}`}
-            onClick={() => setRole('user')}
-          >
-            User
-          </button>
-          <button
-            type="button"
-            className={`role-tab ${role === 'admin' ? 'active' : ''}`}
-            onClick={() => setRole('admin')}
-          >
-            Admin
-          </button>
-        </div>
 
         <form onSubmit={handleSubmit} noValidate>
           <label>
@@ -84,8 +82,10 @@ export default function Login() {
         <p className="footer-line">
           New here? <Link to="/signup">Create a user account</Link>
         </p>
-        <p className="hint">Admins cannot sign up — they are provisioned by the system.</p>
+
       </div>
+
+      <ShareModal open={shareOpen} onClose={() => setShareOpen(false)} />
     </div>
   );
 }
